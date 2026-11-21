@@ -230,6 +230,9 @@ project(':engine-validation').projectDir = file('engine/validation')
 include(':extensions-csv')
 project(':extensions-csv').projectDir = file('extensions/csv')
 
+include(':extensions-db')
+project(':extensions-db').projectDir = file('extensions/db')
+
 include(':extensions-kafka')
 project(':extensions-kafka').projectDir = file('extensions/kafka')
 
