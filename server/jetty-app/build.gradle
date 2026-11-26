@@ -22,6 +22,7 @@ dependencies {
     runtimeOnly project(':logback-print-stream-globals')
     runtimeOnly project(':logback-logbuffer')
     runtimeOnly libs.logback.classic
+    runtimeOnly libs.postgresql
 }
 
 distributions {

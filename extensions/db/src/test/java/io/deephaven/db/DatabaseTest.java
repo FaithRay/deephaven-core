@@ -66,6 +66,42 @@ public class DatabaseTest {
     }
 
     @Test
+    public void appendUsesDateColumnAlreadyOnTheTable() throws Exception {
+        final Path root = Files.createTempDirectory("deephaven-db");
+        try {
+            final Database db = Database.open(root);
+            db.append("Market", "Trades", TableTools.newTable(
+                    TableTools.stringCol("Date", "2024-01-01", "2024-01-01"),
+                    TableTools.stringCol("Sym", "AAPL", "MSFT"),
+                    TableTools.intCol("Qty", 1, 2)));
+            assertEquals(2, db.i("Market", "Trades", false).size());
+            assertTrue(Files.isRegularFile(root.resolve("intraday/Market/Trades/Date=2024-01-01/log")));
+        } finally {
+            delete(root);
+        }
+    }
+
+    @Test
+    public void appendWritesSnapshotThenUpdateView() throws Exception {
+        final Path root = Files.createTempDirectory("deephaven-db");
+        try {
+            final Database db = Database.open(root);
+            final Table src = TableTools.newTable(
+                    TableTools.stringCol("cur_time", "2024-01-01 09:30:00", "2024-01-01 09:30:01"),
+                    TableTools.stringCol("Sym", "AAPL", "MSFT"),
+                    TableTools.intCol("Qty", 1, 2));
+            final Table stamped = src.snapshot()
+                    .updateView("Date = cur_time.substring(0, 10)")
+                    .view("Date", "cur_time", "Sym", "Qty");
+            db.append("Market", "Trades", stamped);
+            assertTrue(Files.isRegularFile(root.resolve("intraday/Market/Trades/Date=2024-01-01/log")));
+            assertEquals(2, db.i("Market", "Trades", false).size());
+        } finally {
+            delete(root);
+        }
+    }
+
+    @Test
     public void historicalFilterAndMerge() throws Exception {
         final Path root = Files.createTempDirectory("deephaven-db");
         try {

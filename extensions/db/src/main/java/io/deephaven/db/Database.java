@@ -2,8 +2,11 @@ package io.deephaven.db;
 
 import io.deephaven.configuration.Configuration;
 import io.deephaven.engine.context.ExecutionContext;
+import io.deephaven.engine.rowset.RowSet;
+import io.deephaven.engine.rowset.RowSetFactory;
+import io.deephaven.engine.rowset.TrackingRowSet;
+import io.deephaven.engine.rowset.WritableRowSet;
 import io.deephaven.engine.table.ColumnSource;
-import io.deephaven.engine.table.PartitionedTable;
 import io.deephaven.engine.table.Table;
 import io.deephaven.engine.table.impl.PartitionAwareSourceTable;
 import io.deephaven.engine.table.impl.QueryTable;
@@ -21,6 +24,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -47,6 +51,10 @@ public final class Database {
             throw new UncheckedIOException(e);
         }
         return new Database(root);
+    }
+
+    public Path root() {
+        return root;
     }
 
     public static Database shared() {
@@ -207,26 +215,55 @@ public final class Database {
         synchronized (lock(namespace, table)) {
             lockWriter(namespace, table);
             final TableSchema schema = schemaForWrite(namespace, table, stamped);
-            final PartitionedTable partitions = copy(stamped).partitionBy(TableSchema.DATE);
-            final ColumnSource<String> dates = partitions.table().getColumnSource(TableSchema.DATE, String.class);
-            final long size = partitions.table().size();
-            for (long ii = 0; ii < size; ii++) {
-                final long row = partitions.table().getRowSet().get(ii);
-                final String date = dates.get(row);
-                Names.checkDate(date);
-                if (hidden(namespace, table, date)) {
-                    throw new IllegalStateException(
-                            "Date " + date + " is already merged for " + namespace + "." + table);
+            final QueryTable rows = (QueryTable) copy(stamped).coalesce();
+            final TrackingRowSet tracking = rows.getRowSet();
+            final long current = tracking.size();
+            final long prev = tracking.sizePrev();
+            final boolean usePrev = current == 0 && prev != 0;
+            final long n = usePrev ? prev : current;
+            if (n == 0) {
+                return;
+            }
+            try (final RowSet rowSet = usePrev ? tracking.copyPrev() : tracking.copy()) {
+                final ColumnSource<?> dateCol = rows.getColumnSource(TableSchema.DATE);
+                final Map<String, WritableRowSet> byDate = new LinkedHashMap<>();
+                try (final RowSet.Iterator it = rowSet.iterator()) {
+                    while (it.hasNext()) {
+                        final long key = it.nextLong();
+                        final Object raw = usePrev ? dateCol.getPrev(key) : dateCol.get(key);
+                        final String date = raw == null ? null : raw.toString();
+                        Names.checkDate(date);
+                        byDate.computeIfAbsent(date, ignored -> RowSetFactory.empty()).insert(key);
+                    }
                 }
-                final Table part = copy(partitions.constituentFor(date)).view(schema.dataColumnNames());
-                if (part.size() == 0) {
-                    continue;
+                final String[] dataCols = schema.dataColumnNames();
+                long written = 0;
+                for (final Map.Entry<String, WritableRowSet> entry : byDate.entrySet()) {
+                    final String date = entry.getKey();
+                    if (hidden(namespace, table, date)) {
+                        throw new IllegalStateException(
+                                "Date " + date + " is already merged for " + namespace + "." + table);
+                    }
+                    final Table part = rows.getSubTable(entry.getValue().toTracking()).view(dataCols);
+                    if (part.size() == 0) {
+                        throw new IllegalStateException(
+                                "Date " + date + " matched no rows of " + namespace + "." + table);
+                    }
+                    final Path dateDir = intradayDateDir(namespace, table, date);
+                    try {
+                        IntradayLog.append(dateDir, ParquetBytes.write(part), Math.toIntExact(part.size()));
+                    } catch (final IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                    if (!Files.isRegularFile(IntradayLog.logFile(dateDir))) {
+                        throw new IllegalStateException(
+                                "append wrote no log at " + IntradayLog.logFile(dateDir));
+                    }
+                    written += part.size();
                 }
-                try {
-                    IntradayLog.append(intradayDateDir(namespace, table, date), ParquetBytes.write(part),
-                            Math.toIntExact(part.size()));
-                } catch (final IOException e) {
-                    throw new UncheckedIOException(e);
+                if (written != n) {
+                    throw new IllegalStateException("Wrote " + written + " of " + n + " rows for " + namespace + "."
+                            + table);
                 }
             }
         }
@@ -315,7 +352,17 @@ public final class Database {
     }
 
     private static Table copy(final Table table) {
-        return ((QueryTable) table.coalesce()).snapshot();
+        final QueryTable coalesced = (QueryTable) table.coalesce();
+        if (coalesced.size() == 0) {
+            return coalesced;
+        }
+        final String[] names = coalesced.getDefinition().getColumnNamesArray();
+        final Table copied = coalesced.select(names);
+        if (copied.size() != coalesced.size()) {
+            throw new IllegalStateException(
+                    "Copy produced " + copied.size() + " rows from " + coalesced.size());
+        }
+        return copied;
     }
 
     private boolean hidden(final String namespace, final String table, final String date) {
